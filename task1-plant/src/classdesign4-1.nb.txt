@@ -1,0 +1,1013 @@
+#@cell markdown
+# 东北大学机器学习课设 · 实验一：植物幼苗分类（改造版）
+
+**任务**：5 类植物幼苗，训练集 500 张（每类 100），测试集 378 张。
+**目标**：对测试集图片输出植物种类，提交 `ID,Category` 两列 CSV。
+
+| 类别 | 英文名（= 提交用的 Category 值） |
+|---|---|
+| 1 | Black-grass |
+| 2 | Common wheat |
+| 3 | Loose Silky-bent |
+| 4 | Scentless Mayweed |
+| 5 | Sugar beet |
+
+---
+
+## 相对 `classdesign4-0` 的改动
+
+| # | 原版问题 | 本版处理 |
+|---|---|---|
+| 1 | `predict_with_tta(...)` **未定义** → 第 8 格直接 `NameError`，TTA 从未跑通 | 统一为 `predict_tta_probs(...)`，多尺度 × 四向翻转 |
+| 2 | 提交列名写成 `image, predicted_class`，与要求的 `ID, Category` 不符 | 输出 `ID,Category`，**保留 `.png` 后缀**，并按官方样例顺序对齐、做集合一致性断言 |
+| 3 | Mixup 产出的软标签被 `y_mixed.argmax(dim=1)` 还原成硬标签，Mixup 几乎失效 | 改为**软标签交叉熵**，软标签全程保留 |
+| 4 | 冻结主干只训分类头，最后只解冻 `stages.3` | **全网络微调** + 主干/分类头分层学习率 + warmup-cosine |
+| 5 | 单次 80/20 划分，100 张验证集，指标噪声 ±3% | **5 折交叉验证** + 4 个主干集成，报告 OOF 指标 |
+| 6 | 每个 epoch 在 DataLoader 里现场做 ExG 绿色分割（CPU 卡顿） | 预处理**一次性缓存**成 `uint8` 数组，训练提速数倍 |
+| 7 | 单一模型，无 TTA | 多尺度 + 四向翻转 TTA，概率域平均 |
+
+## 关键诊断（决定了本版的设计重心）
+
+原版 100 张验证集上的分类报告：
+
+| 类别 | precision | recall | **F1** |
+|---|---|---|---|
+| Black-grass | 0.739 | 0.850 | **0.791** |
+| Common wheat | 0.941 | 0.800 | **0.865** |
+| Loose Silky-bent | 0.889 | 0.800 | **0.842** |
+| Scentless Mayweed | 0.952 | 1.000 | 0.976 |
+| Sugar beet | 0.952 | 1.000 | 0.976 |
+
+**全部误差都集中在三种"禾本科"细叶类（Black-grass / Common wheat / Loose Silky-bent）的互相混淆上**，另外两类已经饱和。
+所以本版的提分手段全部朝这个方向：**更高分辨率 + 全网络微调 + 多主干多样性集成 + 多尺度 TTA** —— 靠"看更细的叶形/叶舌"和"集成降噪"来拆开这三类。
+
+#@cell markdown
+## 0. 环境与全局配置
+
+#@cell code
+import os, sys, math, time, random, json, hashlib, warnings
+from pathlib import Path
+from contextlib import nullcontext
+
+import numpy as np
+import pandas as pd
+from PIL import Image
+import matplotlib
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+import torchvision.transforms as T
+
+from sklearn.model_selection import StratifiedKFold, train_test_split
+from sklearn.metrics import (confusion_matrix, classification_report,
+                             f1_score, accuracy_score)
+
+import timm
+from tqdm.auto import tqdm
+
+warnings.filterwarnings('ignore')
+matplotlib.rcParams['axes.unicode_minus'] = False
+
+print('python  :', sys.version.split()[0])
+print('torch   :', torch.__version__)
+print('timm    :', timm.__version__)
+print('cuda    :', torch.cuda.is_available(),
+      torch.cuda.get_device_name(0) if torch.cuda.is_available() else '')
+
+#@cell code
+# ============================== 全局配置 ==============================
+QUICK_MODE    = False         # True: 只跑 1 个主干 + 1 折（约 10 分钟），用于先验证整条流程
+SEED          = 42
+N_FOLDS       = 1 if QUICK_MODE else 5
+EPOCHS        = 12 if QUICK_MODE else 30
+WARMUP_EPOCHS = 2 if QUICK_MODE else 3
+
+# 分辨率是怎么定的（不是拍的）：对全部 878 张图实测短边，分布是
+#     min=49  p05=81  p25=150  p50=310  p75=588  p90=873  p95=1104  max=2511
+#     短边 >=224 的占 60.7%，>=288 的占 53.0%，<160 的占 27.7%
+# 一度按这个分布把 IMG_SIZE 定成 288。后来在 fold 0 上做了受控 A/B
+# （同 seed=42、同 train_test_split、同 14 epoch、同 bs16、同翻转集，只动分辨率三项）：
+#     224px: best val_f1=0.8990，2 视角 TTA f1=0.8990，637.0s
+#     288px: best val_f1=0.8958，2 视角 TTA f1=0.8759，1554.6s
+# 100 张验证折上 0.003 的差 = 0.3 张图，是噪声 —— 结论是"没测出收益"，不是"288 更差"。
+# 但 288 要多花 (288/224)^2 = 1.65 倍算力，所以退回 224：
+# 它是 ImageNet 预训练的原生分辨率，也让"4 主干 x 5 折"的集成放得进 Kaggle 时限。
+# 那 47% 短边不足 288 的图本来就要被放大，288 只是把插值伪影换成了更多算力。
+BATCH_SIZE    = 16            # 224px 下 16G 显存绰绰有余；bs 小 -> 每 epoch 更新步数更多
+IMG_SIZE      = 224           # 训练分辨率（A/B 依据见上）
+CACHE_SIZE    = 320           # 预缓存分辨率，需 >= max(TTA_SCALES)
+NUM_WORKERS   = 2
+USE_AMP       = torch.cuda.is_available()
+
+LR_HEAD       = 1e-3
+LR_BACKBONE   = 2e-4
+WEIGHT_DECAY  = 0.05
+DROP_PATH     = 0.1
+
+MIXUP_PROB    = 0.0 if QUICK_MODE else 0.5
+MIXUP_ALPHA   = 0.4
+CUTMIX_ALPHA  = 1.0
+CUTMIX_SWITCH = 0.5
+LABEL_SMOOTH  = 0.1
+
+TTA_SCALES    = [224, 288]                        # 候选尺度；最终用哪些由 8.1 的 OOF 选优决定
+                                                  # （224 与训练分辨率一致；288 只是"测试时"假设，
+                                                  #   若 OOF 显示它有害就会自动被排除）
+TTA_FLIPS     = [None, 'h', 'v', 'hv']            # 四向翻转
+
+# 主干配置：segment=True 表示该模型吃"ExG 绿色分割后的黑底图"。
+# 让一半模型用分割图、一半用原图，可以在集成里引入"预处理多样性"。
+BACKBONES = [
+    dict(tag='cnxt_t', name='convnext_tiny',
+         candidates=['convnext_tiny.fb_in22k_ft_in1k', 'convnext_tiny.fb_in1k', 'convnext_tiny'],
+         segment=True),
+    dict(tag='cnxt_s', name='convnext_small',
+         candidates=['convnext_small.fb_in22k_ft_in1k', 'convnext_small.fb_in1k', 'convnext_small'],
+         segment=True),
+    dict(tag='effb3',  name='tf_efficientnet_b3',
+         candidates=['tf_efficientnet_b3.ns_jft_in1k', 'tf_efficientnet_b3'],
+         segment=False),
+    dict(tag='swin_t', name='swin_tiny_patch4_window7_224',
+         candidates=['swin_tiny_patch4_window7_224.ms_in1k', 'swin_tiny_patch4_window7_224'],
+         segment=True),
+]
+if QUICK_MODE:
+    BACKBONES = BACKBONES[:1]
+
+OUT_DIR = Path('/kaggle/working') if Path('/kaggle/working').exists() else Path('./runs')
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+EXPECTED_TEST_N = 378
+
+# 时间预算（分钟）。Kaggle 单次运行最长 12 小时，超时会导致本次运行"什么都拿不到"，
+# 所以这里做一个硬预算：一旦估算出"再跑一折就会超"，就立即停止训练，
+# 用已经训好的模型出提交文件（集成个数少一点，但一定有结果）。
+TIME_BUDGET_MIN = 540
+
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+MEAN = [0.485, 0.456, 0.406]
+STD  = [0.229, 0.224, 0.225]
+
+def autocast_ctx():
+    return torch.cuda.amp.autocast(enabled=USE_AMP) if USE_AMP else nullcontext()
+
+def set_seed(s):
+    random.seed(s); np.random.seed(s)
+    torch.manual_seed(s); torch.cuda.manual_seed_all(s)
+
+set_seed(SEED)
+torch.backends.cudnn.benchmark = True
+
+print(f'QUICK_MODE={QUICK_MODE}  folds={N_FOLDS}  epochs={EPOCHS}  amp={USE_AMP}')
+print(f'OUT_DIR = {OUT_DIR}')
+print(f'集成规模 = {len(BACKBONES)} 主干 x {N_FOLDS} 折 = {len(BACKBONES)*N_FOLDS} 个模型')
+
+#@cell markdown
+## 1. 定位数据集 & 锁定类别顺序
+
+类别名同时是**提交文件里 `Category` 的取值**，所以这里硬编码 + 断言校验，避免
+`sorted(os.listdir())` 在不同环境下的顺序差异把预测映射错。
+
+#@cell code
+CLASSES = ['Black-grass', 'Common wheat', 'Loose Silky-bent',
+           'Scentless Mayweed', 'Sugar beet']
+NUM_CLASSES = len(CLASSES)
+CLS2IDX = {c: i for i, c in enumerate(CLASSES)}
+
+def find_data_root():
+    p = Path('/kaggle/input/competitions/2026task1/dataset-for-task2/dataset-for-task2')
+    if (p / 'train').is_dir() and (p / 'test').is_dir():
+        return p
+    for q in Path('/kaggle/input').rglob('dataset-for-task2'):
+        if q.is_dir() and (q / 'train').is_dir() and (q / 'test').is_dir():
+            return q
+    for q in Path('/kaggle/input').rglob('train'):
+        if q.is_dir() and (q.parent / 'test').is_dir():
+            return q.parent
+    raise FileNotFoundError('没有找到数据集，请检查 Add Input 里是否挂载了比赛数据')
+
+DATA_ROOT = find_data_root()
+TRAIN_DIR = DATA_ROOT / 'train'
+TEST_DIR  = DATA_ROOT / 'test'
+
+found = sorted([d.name for d in TRAIN_DIR.iterdir() if d.is_dir()])
+assert found == CLASSES, f'训练集类别与预期不一致!\n实际={found}\n预期={CLASSES}'
+
+IMG_EXT = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
+
+def list_images(d):
+    return sorted([p for p in Path(d).iterdir() if p.suffix.lower() in IMG_EXT])
+
+train_paths, train_labels = [], []
+for c in CLASSES:
+    fs = list_images(TRAIN_DIR / c)
+    train_paths += fs
+    train_labels += [CLS2IDX[c]] * len(fs)
+
+test_paths = list_images(TEST_DIR)
+test_names = [p.name for p in test_paths]
+train_labels = np.array(train_labels, dtype=np.int64)
+
+print(f'DATA_ROOT  = {DATA_ROOT}')
+print(f'训练图 {len(train_paths)} 张  测试图 {len(test_paths)} 张')
+print('每类数量 :', dict(zip(CLASSES, np.bincount(train_labels, minlength=NUM_CLASSES))))
+assert len(test_paths) == EXPECTED_TEST_N, f'测试集应有 {EXPECTED_TEST_N} 张，实际 {len(test_paths)}'
+
+#@cell markdown
+## 2. ExG 绿色分割（阈值与可视化校验）
+
+`ExG = 2G - R - B`，非绿色区域填黑。相比原版加了两点：
+1. **兜底**：若掩码占比 < 2%（说明阈值过严或光照异常），直接退回原图，避免整张变黑；
+2. 统计每类平均绿色占比，用于判断阈值是否对不同物种公平。
+
+#@cell code
+def green_mask_array(arr, exg_threshold=17, ratio=0.8):
+    """arr: HxWx3 (int16) -> bool mask"""
+    r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+    exg = 2 * g - r - b
+    return (exg > exg_threshold) & (g > r * ratio) & (g > b * ratio)
+
+def green_segment_pil(img, exg_threshold=17, ratio=0.8, min_keep=0.02):
+    """返回 (分割后的 PIL 图, 绿色占比)"""
+    arr = np.asarray(img.convert('RGB'), dtype=np.int16)
+    m = green_mask_array(arr, exg_threshold, ratio)
+    ratio_kept = float(m.mean())
+    if ratio_kept < min_keep:                     # 兜底：几乎全黑就用原图
+        return img.convert('RGB'), ratio_kept
+    out = np.zeros(arr.shape, dtype=np.uint8)
+    out[m] = arr[m].astype(np.uint8)
+    return Image.fromarray(out), ratio_kept
+
+set_seed(SEED)
+fig, axes = plt.subplots(len(CLASSES), 4, figsize=(14, 3 * len(CLASSES)))
+for i, c in enumerate(CLASSES):
+    fs = list_images(TRAIN_DIR / c)[:2]
+    for j, p in enumerate(fs):
+        img = Image.open(p).convert('RGB')
+        seg, r = green_segment_pil(img)
+        axes[i, 2 * j].imshow(img);     axes[i, 2 * j].axis('off')
+        axes[i, 2 * j + 1].imshow(seg); axes[i, 2 * j + 1].axis('off')
+        if j == 0:
+            axes[i, 0].set_title(f'{c}\noriginal', fontsize=9)
+            axes[i, 1].set_title(f'ExG seg   green={r*100:.1f}%', fontsize=9)
+plt.tight_layout(); plt.show()
+
+print('各类平均绿色占比：')
+for c in CLASSES:
+    rs = []
+    for p in list_images(TRAIN_DIR / c)[:15]:
+        _, r = green_segment_pil(Image.open(p))
+        rs.append(r)
+    print(f'  {c:<20s} {np.mean(rs)*100:5.1f}%')
+
+#@cell markdown
+## 3. 图像缓存
+
+原版在 `Dataset.__getitem__` 里逐图做 ExG，每个 epoch 都要重算一遍，CPU 成为瓶颈。
+这里**一次性**把每张图预处理好（可选绿色分割）并缩放到 `CACHE_SIZE` 存成 `uint8` 数组，
+之后训练直接索引内存，随机裁剪/翻转/抖动都在缓存图上做。
+
+* `segment=True` 和 `segment=False` 各缓存一份，供不同主干使用；
+* `CACHE_SIZE=320` 是为了让 `TTA_SCALES=[224, 288]` 里最大的那个尺度还有余量。
+
+#@cell code
+class ImageCache:
+    """把图像预处理结果缓存在内存里：[N, S, S, 3] uint8"""
+    def __init__(self, paths, size, segment, desc=''):
+        self.paths = list(paths)
+        self.size = size
+        self.segment = segment
+        n = len(self.paths)
+        self.data = np.empty((n, size, size, 3), dtype=np.uint8)
+        keep = []
+        for i, p in enumerate(tqdm(self.paths, desc=f'cache {desc} ({n})', leave=False)):
+            img = Image.open(p).convert('RGB')
+            if segment:
+                img, r = green_segment_pil(img)
+                keep.append(r)
+            img = img.resize((size, size), Image.BILINEAR)
+            self.data[i] = np.asarray(img, dtype=np.uint8)
+        self.green_ratio = float(np.mean(keep)) if keep else None
+
+    def __len__(self):
+        return self.data.shape[0]
+
+    def pil(self, i):
+        return Image.fromarray(self.data[i])
+
+_CACHES = {}
+def get_cache(paths, segment, role, size=CACHE_SIZE):
+    key = (role, bool(segment))
+    if key not in _CACHES:
+        _CACHES[key] = ImageCache(paths, size, segment, desc=f'{role}-{"seg" if segment else "raw"}')
+        gr = _CACHES[key].green_ratio
+        extra = f'  mean_green={gr*100:.1f}%' if gr is not None else ''
+        print(f'[cache] {role:<5s} segment={segment}  n={len(paths)}{extra}')
+    return _CACHES[key]
+
+_t = time.time()
+_ = get_cache(train_paths, True, 'train')
+print(f'缓存一遍训练集耗时 {time.time()-_t:.1f}s（后续 epoch 不再重复这个开销）')
+
+#@cell markdown
+## 4. 数据集与数据增强
+
+`RandomResizedCrop(0.6~1.0)` + 水平/垂直翻转 + ±15° 旋转 + 颜色抖动 + RandomErasing。
+验证/测试用 `Resize(1.14x) + CenterCrop`（标准做法，与 ImageNet 预训练一致）。
+
+#@cell code
+class CacheDataset(Dataset):
+    def __init__(self, cache, indices, labels, transform):
+        self.cache = cache
+        self.indices = list(indices)
+        self.labels = list(labels)
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, i):
+        j = self.indices[i]
+        return self.transform(self.cache.pil(j)), self.labels[i]
+
+def train_transform():
+    return T.Compose([
+        T.RandomResizedCrop(IMG_SIZE, scale=(0.6, 1.0), ratio=(0.8, 1.25)),
+        T.RandomHorizontalFlip(),
+        T.RandomVerticalFlip(),
+        T.RandomRotation(15),
+        T.ColorJitter(0.2, 0.2, 0.2, 0.05),
+        T.ToTensor(),
+        T.Normalize(MEAN, STD),
+        T.RandomErasing(p=0.25, scale=(0.02, 0.15)),
+    ])
+
+def eval_transform(size=IMG_SIZE):
+    return T.Compose([
+        T.Resize(int(size * 1.14)),
+        T.CenterCrop(size),
+        T.ToTensor(),
+        T.Normalize(MEAN, STD),
+    ])
+
+def make_loader(cache, indices, labels, transform, shuffle, bs=BATCH_SIZE, workers=NUM_WORKERS):
+    ds = CacheDataset(cache, indices, labels, transform)
+    return DataLoader(ds, batch_size=bs, shuffle=shuffle, num_workers=workers,
+                      pin_memory=True, drop_last=shuffle,
+                      persistent_workers=bool(workers > 0))
+
+def make_folds(labels, n_folds, seed):
+    labels = np.asarray(labels)
+    if n_folds <= 1:
+        idx = np.arange(len(labels))
+        tr, va = train_test_split(idx, test_size=0.2, stratify=labels, random_state=seed)
+        return [(tr, va)]
+    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
+    return list(skf.split(np.zeros(len(labels)), labels))
+
+FOLDS = make_folds(train_labels, N_FOLDS, SEED)
+for k, (tr, va) in enumerate(FOLDS):
+    print(f'fold {k}: train={len(tr)}  val={len(va)}')
+
+#@cell markdown
+## 5. Mixup / CutMix 与软标签损失
+
+**这是原版最大的隐性 bug**：`mixup_fn(x, y)` 输出的是软标签 `y_mixed`，但原版接着写
+`criterion(logits, y_mixed.argmax(dim=1))` —— 软标签被 `argmax` 还原成硬标签，
+Mixup 退化成"随机选一个主类"，正则化效果大打折扣。
+
+本版自己实现 Mixup/CutMix（不依赖 timm 的语义细节），软标签**全程保留**，
+损失用软标签交叉熵；`gamma>0` 时可切换成软标签 Focal Loss。
+
+#@cell code
+def rand_bbox(h, w, lam):
+    cut_rat = math.sqrt(1.0 - lam)
+    cut_w, cut_h = int(w * cut_rat), int(h * cut_rat)
+    cx, cy = np.random.randint(w), np.random.randint(h)
+    x1, y1 = np.clip(cx - cut_w // 2, 0, w), np.clip(cy - cut_h // 2, 0, h)
+    x2, y2 = np.clip(cx + cut_w // 2, 0, w), np.clip(cy + cut_h // 2, 0, h)
+    return int(x1), int(y1), int(x2), int(y2)
+
+def mixup_cutmix(x, y_soft, prob=MIXUP_PROB, alpha_mix=MIXUP_ALPHA,
+                 alpha_cut=CUTMIX_ALPHA, switch=CUTMIX_SWITCH):
+    """x:[B,3,H,W]  y_soft:[B,C] one-hot/软标签 -> (mixed_x, mixed_soft_target)"""
+    if prob <= 0 or np.random.rand() > prob:
+        return x, y_soft
+    idx = torch.randperm(x.size(0), device=x.device)
+    y2 = y_soft[idx]
+    if np.random.rand() < switch:
+        lam = float(np.random.beta(alpha_mix, alpha_mix))
+        x = lam * x + (1.0 - lam) * x[idx]
+        y = lam * y_soft + (1.0 - lam) * y2
+    else:
+        lam = float(np.random.beta(alpha_cut, alpha_cut))
+        x1, y1, x2, y2_ = rand_bbox(x.size(2), x.size(3), lam)
+        if x2 - x1 > 0 and y2_ - y1 > 0:
+            x[:, :, y1:y2_, x1:x2] = x[idx, :, y1:y2_, x1:x2]
+        lam = 1.0 - ((x2 - x1) * (y2_ - y1) / (x.size(2) * x.size(3)))
+        y = lam * y_soft + (1.0 - lam) * y2
+    return x, y
+
+class SoftTargetLoss(nn.Module):
+    """软标签交叉熵；gamma>0 时等价于软标签 Focal Loss。"""
+    def __init__(self, gamma=0.0, smoothing=LABEL_SMOOTH, num_classes=NUM_CLASSES):
+        super().__init__()
+        self.gamma = gamma
+        self.smoothing = smoothing
+        self.C = num_classes
+
+    def smooth(self, t):
+        if self.smoothing <= 0:
+            return t
+        return t * (1.0 - self.smoothing) + self.smoothing / self.C
+
+    def forward(self, logits, target_soft):
+        t = self.smooth(target_soft)
+        logp = F.log_softmax(logits, dim=-1)
+        loss = -(t * logp)
+        if self.gamma > 0:
+            loss = loss * (1.0 - logp.exp()).pow(self.gamma)
+        return loss.sum(dim=-1).mean()
+
+#@cell markdown
+## 6. 模型工厂
+
+`timm.create_model(..., num_classes=0)` 取主干特征，接一个 Dropout + Linear 分类头。
+`candidates` 里按优先级尝试权重名：Kaggle 比赛环境经常**关闭外网**，某些权重名
+不在本地缓存里，逐个降级尝试；全部失败则**跳过该主干**（而不是偷偷用随机初始化训练——
+500 张图从零训是不可能收敛的）。
+
+#@cell code
+def create_backbone(cfg, drop_path=DROP_PATH):
+    for nm in cfg['candidates']:
+        try:
+            bb = timm.create_model(nm, pretrained=True, num_classes=0,
+                                   drop_path_rate=drop_path)
+            print(f'  [ok] backbone = {nm}')
+            return bb, nm
+        except Exception as e:
+            print(f'  [--] {nm}: {type(e).__name__}: {str(e)[:90]}')
+    print('  [!!] 所有候选权重都不可用，跳过该主干')
+    return None, None
+
+class PlantNet(nn.Module):
+    def __init__(self, backbone, num_classes=NUM_CLASSES, drop=0.2):
+        super().__init__()
+        self.backbone = backbone
+        feat = getattr(backbone, 'num_features', None)
+        if feat is None:
+            with torch.no_grad():
+                feat = backbone(torch.zeros(1, 3, 64, 64)).shape[1]
+        self.feat_dim = int(feat)
+        self.drop = nn.Dropout(drop)
+        self.fc = nn.Linear(self.feat_dim, num_classes)
+
+    def forward(self, x):
+        return self.fc(self.drop(self.backbone(x)))
+
+def build_optimizer(model, lr_head=LR_HEAD, lr_backbone=LR_BACKBONE, wd=WEIGHT_DECAY):
+    head, bb = [], []
+    for n, p in model.named_parameters():
+        (head if n.startswith('fc') else bb).append(p)
+    groups = []
+    if bb:
+        groups.append({'params': bb, 'lr': lr_backbone})
+    if head:
+        groups.append({'params': head, 'lr': lr_head})
+    return torch.optim.AdamW(groups, weight_decay=wd)
+
+def lr_lambda(step, total, warmup, min_ratio=0.02):
+    if step < warmup:
+        return (step + 1) / max(1, warmup)
+    t = (step - warmup) / max(1, total - warmup)
+    t = min(1.0, max(0.0, t))
+    return min_ratio + (1.0 - min_ratio) * 0.5 * (1.0 + math.cos(math.pi * t))
+
+_m = PlantNet(timm.create_model('convnext_tiny', pretrained=False, num_classes=0))
+_trainable = sum(p.numel() for p in _m.parameters() if p.requires_grad)
+print(f'模型结构自检: 输出 {tuple(_m(torch.randn(2, 3, IMG_SIZE, IMG_SIZE)).shape)}, '
+      f'可训练参数 {_trainable/1e6:.2f}M')
+del _m
+
+#@cell markdown
+## 7. 训练 / 评估 / TTA 推断
+
+* 每个 fold 独立 `AdamW` + warmup + cosine，**全部参数可训练**（全网络微调）；
+* 梯度裁剪 5.0，AMP 混合精度；
+* 按验证集 macro-F1 保存最佳权重；
+* OOF / 测试推断用 **多尺度 × 四向翻转 TTA**，在概率域平均。
+
+#@cell code
+@torch.no_grad()
+def evaluate(model, loader, device):
+    model.eval()
+    preds, gts = [], []
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        with autocast_ctx():
+            out = model(x)
+        preds.append(out.float().argmax(1).cpu().numpy())
+        gts.append(y.numpy())
+    preds = np.concatenate(preds); gts = np.concatenate(gts)
+    return (accuracy_score(gts, preds),
+            f1_score(gts, preds, average='macro', zero_division=0),
+            preds, gts)
+
+def tta_view_keys(scales, flips):
+    """TTA 的每一个"视角"给一个稳定的字符串 key，形如 '224|h'。"""
+    return [f'{size}|{flip or "orig"}' for size in scales for flip in flips]
+
+@torch.no_grad()
+def predict_tta_view_probs(model, cache, indices, device,
+                           scales=(IMG_SIZE,), flips=(None,), bs=64):
+    """逐视角返回概率，不平均。
+
+    返回 dict: key -> [len(indices), NUM_CLASSES]。key 见 tta_view_keys()。
+
+    为什么要逐视角而不是直接平均：TTA 不是"加了就一定涨"。把不同分辨率的视角
+    混进来会改变输入的有效尺度，而模型是在单一分辨率（IMG_SIZE + 1.14x resize +
+    center crop）下训出来的，多出来的尺度可能反而掉分。之前实测就有过这种回退。
+    所以这里把每个视角单独存下来，交给 OOF 去"用数据选"，而不是拍脑袋定。
+    """
+    model.eval()
+    idx = list(indices)
+    out = {}
+    for size in scales:
+        base = eval_transform(size)
+        for flip in flips:
+            key = f'{size}|{flip or "orig"}'
+            acc = []
+            for s in range(0, len(idx), bs):
+                chunk = idx[s:s + bs]
+                xb = torch.stack([base(cache.pil(j)) for j in chunk]).to(device)
+                if flip and 'h' in flip:
+                    xb = torch.flip(xb, dims=[3])
+                if flip and 'v' in flip:
+                    xb = torch.flip(xb, dims=[2])
+                with autocast_ctx():
+                    logit = model(xb)
+                acc.append(F.softmax(logit.float(), dim=-1).cpu().numpy())
+            out[key] = np.concatenate(acc, axis=0)
+    return out
+
+@torch.no_grad()
+def predict_tta_probs(model, cache, indices, device,
+                      scales=(IMG_SIZE,), flips=(None,), bs=64):
+    """返回 [len(indices), NUM_CLASSES] 的 TTA 平均概率（所有视角等权）"""
+    views = predict_tta_view_probs(model, cache, indices, device,
+                                   scales=scales, flips=flips, bs=bs)
+    stack = np.stack(list(views.values()), axis=0)
+    return stack.mean(axis=0)
+
+def train_one_fold(cfg, fold, tr_idx, va_idx, device, train_cache, verbose=True):
+    """训练单个 fold，返回 {'model','best_f1','best_acc','history'}"""
+    # 这里不能用内建 hash()：Python 3 对 str 的 hash 每个进程都掺了随机盐
+    # （PEP 456，PYTHONHASHSEED 默认随机），同一个 notebook 每次跑出来的种子都不同，
+    # 结果就不可复现（同一份代码两次跑分数不一样，交作业和查错都会很难受）。
+    # 改用 md5 前 8 位十六进制：跨进程、跨机器、跨版本都稳定。
+    set_seed(SEED + 100 * fold + (int(hashlib.md5(cfg['tag'].encode()).hexdigest()[:8], 16) % 97))
+
+    bb, bb_name = create_backbone(cfg)
+    if bb is None:
+        return None
+    model = PlantNet(bb).to(device)
+
+    train_loader = make_loader(train_cache, tr_idx, train_labels[tr_idx],
+                               train_transform(), shuffle=True)
+    val_loader = make_loader(train_cache, va_idx, train_labels[va_idx],
+                             eval_transform(), shuffle=False)
+
+    criterion = SoftTargetLoss(gamma=0.0)
+    opt = build_optimizer(model)
+    total_steps = len(train_loader) * EPOCHS
+    warmup_steps = len(train_loader) * WARMUP_EPOCHS
+    sched = torch.optim.lr_scheduler.LambdaLR(
+        opt, lr_lambda=lambda s: lr_lambda(s, total_steps, warmup_steps))
+    scaler = torch.cuda.amp.GradScaler(enabled=USE_AMP)
+
+    best = {'f1': -1.0, 'acc': 0.0, 'state': None, 'epoch': -1}
+    history = {'loss': [], 'val_acc': [], 'val_f1': []}
+    it = 0
+    for ep in range(EPOCHS):
+        model.train()
+        run_loss, n_seen = 0.0, 0
+        pbar = tqdm(train_loader, desc=f'{cfg["tag"]} f{fold} ep{ep+1}/{EPOCHS}',
+                    leave=False, disable=not verbose)
+        for x, y in pbar:
+            x = x.to(device, non_blocking=True)
+            y_soft = F.one_hot(y, NUM_CLASSES).float().to(device)
+            xm, ym = mixup_cutmix(x, y_soft)
+
+            opt.zero_grad(set_to_none=True)
+            with autocast_ctx():
+                logits = model(xm)
+                loss = criterion(logits, ym)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            scaler.step(opt)
+            scaler.update()
+            sched.step()
+
+            it += 1
+            run_loss += loss.item() * x.size(0); n_seen += x.size(0)
+            pbar.set_postfix(loss=f'{run_loss/max(1,n_seen):.3f}',
+                             lr=f'{opt.param_groups[0]["lr"]:.2e}')
+
+        va, vf, _, _ = evaluate(model, val_loader, device)
+        history['loss'].append(run_loss / max(1, n_seen))
+        history['val_acc'].append(va); history['val_f1'].append(vf)
+        if vf > best['f1']:
+            best = {'f1': vf, 'acc': va, 'epoch': ep,
+                    'state': {k: v.detach().clone() for k, v in model.state_dict().items()}}
+        if verbose:
+            print(f'  [{cfg["tag"]} f{fold}] ep{ep+1:02d} '
+                  f'loss={run_loss/max(1,n_seen):.3f} val_acc={va:.3f} val_f1={vf:.3f}')
+
+    model.load_state_dict(best['state'])
+    return {'model': model, 'best_f1': best['f1'], 'best_acc': best['acc'],
+            'best_epoch': best['epoch'], 'history': history, 'backbone': bb_name}
+
+#@cell markdown
+## 8. 主实验：多主干 × K 折
+
+输出三样东西：
+1. **每折 / 每主干**的验证 F1 表；
+2. **OOF（out-of-fold）** 的混淆矩阵与分类报告 —— 这是对"真实泛化能力"最诚实的估计（每张验证图都由没见过它的模型预测）；
+3. 测试集的集成概率 `test_probs.npy`（后面直接用来出提交文件）。
+
+#@cell code
+t_start = time.time()
+N_TRAIN, N_TEST = len(train_paths), len(test_paths)
+
+oof_sum   = np.zeros((N_TRAIN, NUM_CLASSES))
+oof_cnt   = np.zeros(N_TRAIN)
+test_sum  = np.zeros((N_TEST, NUM_CLASSES))
+test_cnt  = 0
+
+# 逐视角累加（key 形如 '288|h'）。TTA 视角的取舍不用手调，交给 8.1 的 OOF 去选。
+VIEW_KEYS = tta_view_keys(TTA_SCALES, TTA_FLIPS)
+oof_view_sum  = {k: np.zeros((N_TRAIN, NUM_CLASSES)) for k in VIEW_KEYS}
+test_view_sum = {k: np.zeros((N_TEST,  NUM_CLASSES)) for k in VIEW_KEYS}
+
+summary_rows = []
+per_backbone_oof = {}
+histories = {}
+fold_secs = []
+stopped_early = False
+
+for cfg in BACKBONES:
+    tag, seg = cfg['tag'], cfg['segment']
+    print(f'\n{"="*74}\n[主干 {tag}] {cfg["name"]}   segment={seg}\n{"="*74}')
+    train_cache = get_cache(train_paths, seg, 'train')
+    test_cache  = get_cache(test_paths,  seg, 'test')
+
+    for fold, (tr_idx, va_idx) in enumerate(FOLDS):
+        # ---- 时间预算闸门：宁可少集成，也不能超时丢掉全部结果 ----
+        elapsed_min = (time.time() - t_start) / 60
+        if fold_secs:
+            est_min = float(np.mean(fold_secs)) / 60
+            if elapsed_min + est_min > TIME_BUDGET_MIN:
+                print(f'\n[时间预算] 已用 {elapsed_min:.0f} min，再跑一折预计还要 {est_min:.0f} min，'
+                      f'将超过预算 {TIME_BUDGET_MIN} min —— 停止训练。')
+                print(f'          已完成 {test_cnt} 个模型，用它们出提交文件。')
+                stopped_early = True
+                break
+
+        t0 = time.time()
+        res = train_one_fold(cfg, fold, tr_idx, va_idx, DEVICE, train_cache)
+        if res is None:
+            print(f'  [skip] {tag} 权重不可用，跳过')
+            break
+        model = res['model']
+
+        # 验证集 TTA 与测试集用完全相同的 scales/flips，
+        # 这样 OOF 指标估计的就是"提交时那套推断流程"的表现，而不是另一套。
+        # 逐视角存下来，最后用 OOF 选一个最好的视角子集（见 8.1）。
+        val_views = predict_tta_view_probs(model, train_cache, va_idx, DEVICE,
+                                           scales=TTA_SCALES, flips=TTA_FLIPS)
+        for k, p in val_views.items():
+            oof_view_sum[k][va_idx] += p
+        val_probs = np.mean(list(val_views.values()), axis=0)   # 全视角平均，仅用于单主干对比
+        oof_sum[va_idx] += val_probs
+        oof_cnt[va_idx] += 1
+        per_backbone_oof.setdefault(tag, np.zeros((N_TRAIN, NUM_CLASSES)))[va_idx] += val_probs
+
+        tta_f1 = f1_score(train_labels[va_idx], val_probs.argmax(1),
+                          average='macro', zero_division=0)
+        tta_acc = accuracy_score(train_labels[va_idx], val_probs.argmax(1))
+
+        test_views = predict_tta_view_probs(model, test_cache, range(N_TEST), DEVICE,
+                                            scales=TTA_SCALES, flips=TTA_FLIPS)
+        for k, p in test_views.items():
+            test_view_sum[k] += p
+        tp = np.mean(list(test_views.values()), axis=0)
+        test_sum += tp
+        test_cnt += 1
+
+        row = dict(backbone=tag, fold=fold, best_val_f1=res['best_f1'],
+                   tta_val_f1=tta_f1, tta_val_acc=tta_acc,
+                   best_epoch=res['best_epoch'] + 1, secs=round(time.time() - t0, 1))
+        summary_rows.append(row)
+        histories[(tag, fold)] = res['history']
+        fold_secs.append(row['secs'])
+        print(f'  [{tag} f{fold}] no-TTA F1={res["best_f1"]:.4f} | '
+              f'TTA F1={tta_f1:.4f} acc={tta_acc:.4f} | {row["secs"]}s')
+        print(f'   已用 {(time.time()-t_start)/60:.0f} min / 预算 {TIME_BUDGET_MIN} min，'
+              f'已完成 {test_cnt}/{len(BACKBONES)*len(FOLDS)} 个模型')
+
+        # 中途保险：每折结束就把当前集成结果落盘。
+        # Kaggle 上若后面某个 cell 报错，运行仍会"完成"并保存 /kaggle/working，
+        # 所以这一份朴素提交文件能兜住"最后一格挂了"的情况。
+        pd.DataFrame({'ID': test_names,
+                      'Category': [CLASSES[i] for i in test_sum.argmax(1)]}
+                     ).to_csv(OUT_DIR / 'submission_partial.csv', index=False)
+        del model
+        torch.cuda.empty_cache()
+
+    print(f'  累计用时 {(time.time()-t_start)/60:.1f} min')
+    if stopped_early:
+        break
+
+summary = pd.DataFrame(summary_rows)
+print(f'\n总耗时 {(time.time()-t_start)/60:.1f} min')
+print(f'集成模型数 = {test_cnt}')
+display(summary)
+
+#@cell markdown
+### 8.1 OOF 汇总评估
+
+#@cell code
+oof_probs = oof_sum / np.maximum(oof_cnt[:, None], 1)
+oof_pred  = oof_probs.argmax(1)
+
+# 关键：只统计"至少进过一次验证折"的样本（oof_cnt > 0）。
+# 若直接对全量算指标，那些 cnt==0 的样本概率恒为 0 向量，argmax 会一律落在类别 0，
+# 把指标压低且不报错（原版 QUICK_MODE 下就踩了这个坑：真实 0.75 被显示成 0.31）。
+covered = oof_cnt > 0
+n_cov = int(covered.sum())
+oof_acc = accuracy_score(train_labels[covered], oof_pred[covered])
+oof_f1  = f1_score(train_labels[covered], oof_pred[covered], average='macro', zero_division=0)
+print(f'==== OOF (每张被覆盖的图都由没见过它的模型预测) ====')
+print(f'覆盖样本 = {n_cov}/{N_TRAIN} ({n_cov/N_TRAIN:.1%})')
+if n_cov < N_TRAIN:
+    miss = np.bincount(train_labels[~covered], minlength=NUM_CLASSES)
+    print(f'[警告] 有 {N_TRAIN - n_cov} 张从未进入任何验证折，已从 OOF 指标中剔除。')
+    print(f'        未覆盖样本的类别分布: {dict(zip(CLASSES, miss.tolist()))}')
+    if N_FOLDS > 1:
+        print('        5 折正常情况下应当全覆盖；出现缺口说明某折没跑成功（如权重下载失败被 skip）。')
+    else:
+        print('        QUICK_MODE 下只跑 1 折，OOF 天然只覆盖验证折，指标仅供流程验证，不代表最终成绩。')
+print(f'accuracy = {oof_acc:.4f}    macro-F1 = {oof_f1:.4f}')
+
+# ---- 用 OOF 选一个最好的 TTA 视角子集 ----
+# 多视图 TTA 不保证更好：把 IMG_SIZE 之外的尺度混进来会改变输入的有效尺度，
+# 而模型是在单一分辨率（IMG_SIZE，配 1.14x resize + center crop）下训出来的，
+# 额外尺度可能反而掉分（这正是"训练/测试分辨率不一致"的经典坑）。
+# 所以不猜，直接把每个候选子集在 OOF 上打分，挑最好的那个去跑测试集。
+def _oof_f1_of(keys):
+    # 逐视角累加的是"概率"（每折一份），所以分母既要去掉模型数、也要去掉视角数。
+    # 少了这个除法，argmax 出来的标签**仍然是对的**（正的常数缩放不改变 argmax），
+    # 但打印出来的置信度和存盘的 *_probs.npy 就不再是概率了 —— 那是会骗人的。
+    p = sum(oof_view_sum[k] for k in keys) / (np.maximum(oof_cnt, 1)[:, None] * len(keys))
+    return f1_score(train_labels[covered], p[covered].argmax(1),
+                    average='macro', zero_division=0)
+
+_cands = [(k,) for k in VIEW_KEYS]                                   # 每个单视角
+for _size in TTA_SCALES:                                            # 同一尺度下的全部翻转
+    _ks = tuple(k for k in VIEW_KEYS if k.startswith(f'{_size}|'))
+    if len(_ks) > 1:
+        _cands.append(_ks)
+_ks_train = tuple(k for k in VIEW_KEYS if k.startswith(f'{IMG_SIZE}|'))
+if _ks_train:                                                       # 训练分辨率下的全部翻转
+    _cands.append(_ks_train)
+_cands.append(tuple(VIEW_KEYS))                                     # 全部视角（旧行为）
+_seen, _uniq = set(), []
+for _c in _cands:
+    if _c not in _seen:
+        _seen.add(_c); _uniq.append(_c)
+_cands = _uniq
+
+_rowlist = [dict(views='+'.join(_c), n_views=len(_c), oof_f1=_oof_f1_of(_c)) for _c in _cands]
+view_tbl = pd.DataFrame(_rowlist).sort_values(['oof_f1', 'n_views'],
+                                              ascending=[False, True]).reset_index(drop=True)
+
+print('\n所有候选视角子集在 OOF 上的打分（仅供参考 —— 不要照抄第一名，原因见下）:')
+display(view_tbl)
+
+# 规则：**先在"尺度"这一层选择，再在该尺度内平均它的全部翻转；绝不挑单个视角。**
+#
+# 这条规则不是偏好，是两次独立跑逼出来的。两次跑的配置完全相同，只差一个随机种子：
+#   第 1 跑：单视角第一名是 288|hv (0.9010)，而 224|orig 只有 0.8974
+#   第 2 跑：单视角第一名是 224|orig (0.9133)，而 288|hv 掉到 0.8968
+# **两次跑挑出的"最佳单视角"完全相反。** 这就是选择偏差的签名：8 个单视角各自的
+# OOF 分数都带约 1 个点的噪声（500 张图上 macro-F1 的标准误就有 1.3 个点），
+# 取其中最大的那个，涨的是噪声，不是真实能力。
+#
+# 而"同一尺度下四个翻转的平均"是稳定量 —— 两次跑一致地给出 224 那一组更好：
+#   224 四翻转 = 0.8991 / 0.9050        288 四翻转 = 0.8905 / 0.8943
+# 分别高出 0.86 和 1.07 个点，方向一致。机理上也讲得通：288 是训练分辨率之外的尺度，
+# 测试时换尺度会引入 train-test resolution discrepancy（FixRes 那篇讲的正是这件事）。
+#
+# 另外，五次训练只换种子，整份 5 折 OOF 就从 0.8940 跳到 0.9040 —— **种子本身值 1 个点**。
+# 所以任何 0.5 点以内的差别都不该被当成结论。
+_scale_sets = []
+for _size in TTA_SCALES:
+    _ks = tuple(k for k in VIEW_KEYS if k.startswith(f'{_size}|'))
+    if _ks:
+        _scale_sets.append((_size, _ks))
+_scale_f1 = {s: _oof_f1_of(ks) for s, ks in _scale_sets}
+_best_scale = max(_scale_f1, key=_scale_f1.get)
+BEST_VIEWS = dict(_scale_sets)[_best_scale]
+print('\n每个尺度的"全部翻转"在 OOF 上的得分（尺度层比较比单视角稳得多）:')
+display(pd.DataFrame([dict(scale=s, n_views=len(ks), oof_f1=_scale_f1[s])
+                      for s, ks in _scale_sets])
+        .sort_values('oof_f1', ascending=False).reset_index(drop=True))
+print(f'>> 选中尺度 {_best_scale}（该尺度全部翻转的 OOF macro-F1 = {_scale_f1[_best_scale]:.4f}）')
+print(f'>> 提交用视角 = {"+".join(BEST_VIEWS)}（该尺度的全部 {len(BEST_VIEWS)} 个翻转取平均）')
+print(f'   参考：全 8 视角平均 = {_oof_f1_of(tuple(VIEW_KEYS)):.4f}')
+
+cm = confusion_matrix(train_labels[covered], oof_pred[covered])
+plt.figure(figsize=(6.6, 5.4))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=CLASSES, yticklabels=CLASSES)
+plt.title(f'Ensemble OOF Confusion Matrix\nAcc={oof_acc:.4f}  Macro-F1={oof_f1:.4f}')
+plt.xlabel('predicted'); plt.ylabel('true')
+plt.xticks(rotation=30, ha='right')
+plt.tight_layout(); plt.show()
+
+print('\n分类报告 (OOF):')
+print(classification_report(train_labels[covered], oof_pred[covered],
+                            labels=list(range(NUM_CLASSES)), target_names=CLASSES, digits=4))
+
+# 单主干对比
+rows = []
+for tag, p in per_backbone_oof.items():
+    n = np.maximum((p.sum(1) > 0).sum(), 1)
+    m = p.sum(1) > 0
+    rows.append(dict(backbone=tag,
+                     oof_acc=accuracy_score(train_labels[m], p[m].argmax(1)),
+                     oof_f1=f1_score(train_labels[m], p[m].argmax(1),
+                                     average='macro', zero_division=0)))
+rows.append(dict(backbone='ENSEMBLE', oof_acc=oof_acc, oof_f1=oof_f1))
+print('\n各主干 vs 集成 (OOF):')
+display(pd.DataFrame(rows).sort_values('oof_f1', ascending=False))
+
+# 训练曲线
+n_show = len(histories)
+if n_show:
+    fig, axes = plt.subplots(1, 2, figsize=(13, 4))
+    for (tag, fold), h in histories.items():
+        axes[0].plot(h['loss'], label=f'{tag} f{fold}', alpha=0.8)
+        axes[1].plot(h['val_f1'], label=f'{tag} f{fold}', alpha=0.8)
+    axes[0].set_title('train loss'); axes[0].set_xlabel('epoch'); axes[0].legend(fontsize=7)
+    axes[1].set_title('val macro-F1 (no TTA)'); axes[1].set_xlabel('epoch'); axes[1].legend(fontsize=7)
+    plt.tight_layout(); plt.show()
+
+# 最容易被混淆的类别对
+off = cm.copy(); np.fill_diagonal(off, 0)
+pairs = [(CLASSES[i], CLASSES[j], int(off[i, j]))
+         for i in range(NUM_CLASSES) for j in range(NUM_CLASSES) if i != j and off[i, j] > 0]
+pairs.sort(key=lambda t: -t[2])
+print('\n最容易混淆的类别对 (真实 -> 预测: 次数):')
+for a, b, c in pairs[:6]:
+    print(f'  {a:<20s} -> {b:<20s} {c}')
+
+#@cell markdown
+## 9. 生成提交文件
+
+提交要求：两列 `ID,Category`，`ID` 是**含 `.png` 后缀**的文件名。
+这里额外做四件事保证不被判格式错：
+
+1. 行数必须等于 378；
+2. `ID` 集合必须与官方样例**完全一致**；
+3. 若在 `/kaggle/input` 下找到官方样例提交，就**按样例的行顺序重排**；
+4. 类别取值必须落在 5 个合法字符串内。
+
+#@cell code
+# 分母要同时去掉"模型数"和"视角数"：*_view_sum[k] 是"每折一份 × 每个视角一份"的累加。
+# 漏掉视角数不改变预测标签，但会让下面打印的平均置信度变成 3.3 之类的非概率值。
+final_probs = sum(test_view_sum[k] for k in BEST_VIEWS) / (max(1, test_cnt) * len(BEST_VIEWS))
+oof_probs   = sum(oof_view_sum[k] for k in BEST_VIEWS) / (np.maximum(oof_cnt, 1)[:, None] * len(BEST_VIEWS))
+print(f'提交用的 TTA 视角 = {"+".join(BEST_VIEWS)}（由 8.1 的 OOF 选中）')
+np.save(OUT_DIR / 'test_probs.npy', final_probs)
+np.save(OUT_DIR / 'oof_probs.npy', oof_probs)
+pd.DataFrame(summary).to_csv(OUT_DIR / 'fold_summary.csv', index=False)
+view_tbl.to_csv(OUT_DIR / 'tta_view_scores.csv', index=False)
+# 逐视角的概率和也一并存下来：以后想改选优规则（比如调 VIEW_TIE_MARGIN）或换一组视角
+# 重出提交文件，直接读这个 npz 就够了，不必把 5 折重训一遍。
+np.savez_compressed(OUT_DIR / 'tta_view_probs.npz',
+                    oof_cnt=oof_cnt, test_cnt=test_cnt,
+                    **{f'oof__{k}': v for k, v in oof_view_sum.items()},
+                    **{f'test__{k}': v for k, v in test_view_sum.items()})
+
+# 兜底断言：一个模型都没跑成的话，test_sum 全 0、argmax 全落在类别 0，
+# 会静默产出一份"378 行全是 Black-grass"的垃圾提交。这里必须拦住。
+# 最常见的原因是 Kaggle 的 Internet 没开 → timm 下不到预训练权重 → 所有主干被 skip。
+assert test_cnt > 0, (
+    '没有任何模型训练成功，无法生成提交文件。\n'
+    '最常见原因：Kaggle 的 Settings → Internet 没有打开，timm 无法下载预训练权重，'
+    '4 个主干全部被跳过。请打开 Internet 后重跑。')
+
+test_pred = final_probs.argmax(1)
+sub = pd.DataFrame({'ID': test_names, 'Category': [CLASSES[i] for i in test_pred]})
+print(f'预测概率矩阵 {final_probs.shape}，平均置信度 {final_probs.max(1).mean():.4f}')
+print('\n预测分布:')
+print(sub['Category'].value_counts())
+
+if sub['Category'].nunique() == 1:
+    print(f'\n[严重警告] 378 个预测全是同一个类别（{sub["Category"].iloc[0]}）。')
+    print('           集成结果退化，多半是某个环节出错了，不要把这份文件交上去。')
+if sub['Category'].nunique() < NUM_CLASSES:
+    missing = [c for c in CLASSES if c not in set(sub['Category'])]
+    print(f'\n[提示] 以下类别一张都没被预测到：{missing}（378 张里可能确实没有，也可能模型偏了）。')
+
+def find_sample_submission(expected_ids):
+    want = set(expected_ids)
+    for base in ['/kaggle/input', '.']:
+        b = Path(base)
+        if not b.exists():
+            continue
+        try:
+            cands = [q for q in b.rglob('*.csv') if 'submission' in q.name.lower()]
+        except Exception:
+            continue
+        for q in cands:
+            try:
+                df = pd.read_csv(q)
+            except Exception:
+                continue
+            cols = {c.lower(): c for c in df.columns}
+            if 'id' in cols and len(df) == len(expected_ids) \
+               and set(df[cols['id']].astype(str)) == want:
+                return q, df
+    return None, None
+
+sample_path, sample_df = find_sample_submission(test_names)
+if sample_path is not None:
+    id_col = [c for c in sample_df.columns if c.lower() == 'id'][0]
+    order = sample_df[id_col].astype(str).tolist()
+    sub = sub.set_index('ID').reindex(order).reset_index()
+    print(f'已按官方样例顺序对齐: {sample_path}')
+else:
+    print('未找到官方样例提交，按文件名排序输出（ID 集合仍会校验）')
+
+assert len(sub) == EXPECTED_TEST_N, f'行数应为 {EXPECTED_TEST_N}，实际 {len(sub)}'
+assert sub['ID'].is_unique and sub['ID'].notna().all(), 'ID 有缺失或重复'
+assert set(sub['ID']) == set(test_names), 'ID 集合与测试集不一致'
+assert sub['Category'].notna().all(), '存在未预测的样本'
+assert set(sub['Category']).issubset(set(CLASSES)), '出现了非法类别名'
+
+sub_path = OUT_DIR / 'submission.csv'
+sub.to_csv(sub_path, index=False)
+print(f'\n已写出: {sub_path}   形状={sub.shape}')
+print(sub.head(10).to_string(index=False))
+print('...')
+print(sub.tail(3).to_string(index=False))
+
+#@cell markdown
+## 10. 结果记录 & 后续可选提升
+
+### 提交
+把 `/kaggle/working/submission.csv` 下载下来，直接提交即可（列名 `ID,Category`，378 行）。
+
+### 已实测的分数（用来校准后续估计）
+* 本地 CPU 单模型（ConvNeXt-Tiny / 400 张 / 14 epoch @224 / 2 向 TTA）出过一份提交，
+  本地留出集 `val_acc=0.9000 / macro-F1=0.8990`，**实际排行榜 `0.8915`** —— 差 0.85 个点，
+  说明留出集可以当规划依据（±1 点以内）。
+* **这 0.85 个点有一个机制上的解释**：`train_one_fold()` 每轮用同一个验证折算 `val_f1`，
+  然后取 `argmax` 那一轮的权重（`if vf > best['f1']` → `load_state_dict(best['state'])`）。
+  也就是说下面 OOF 报出来的数字是"20 轮里挑出来的最大值"，而挑选依据正是它自己被打分的标签。
+  验证折只有 100 张，逐轮 `val_f1` 实测波动区间约 **0.83~0.91**（本机 full 档 fold 0：
+  ep14 0.833 / ep15 0.899 / ep16 0.869 / ep17 0.901 / ep18 0.901 / ep19 0.910），
+  **取最大比取后几轮均值大约高 2 个点**。
+  > 这只影响"预计能得多少分"，**不影响提交质量**——用训练折自己的验证集挑 checkpoint、
+  > 再预测真正没见过的测试集，是正规做法。记住：**本 notebook 打印的 OOF 会比排行榜高约 1 个点。**
+* 那 41 个错误（378×10.85%）**全部落在 Black-grass / Common wheat / Loose Silky-bent 三者内部**，
+  后两类（Scentless Mayweed、Sugar beet）在留出集上是 0 错误。
+  所以后面所有提分都等价于"把禾本科这三种分开"，其余努力基本无效。
+
+### 如果还有时间，按性价比排序的下一步
+1. **先跑 `QUICK_MODE=True`**（约 10 分钟）确认整条流程通，再全量跑。
+2. **加公开数据**（最大的一个杠杆）：这 5 类是 Kaggle 公开数据集 *Plant Seedlings Classification*（12 类）的子集。
+   在 `Add Input` 里挂上该数据集，把其中这 5 类的图并进训练集（约 4~5 倍数据量）。
+   **但有两个必须先解决的问题：**
+   - **规则**：课设说明没有提外部数据。用之前去问老师，并在报告里写明数据来源，否则算学术不端。
+   - **是否会造成泄漏**：本比赛的 878 张图用的是「11 位小写随机串 + `.png`」这种文件名。
+     如果 organizers 就是从公开数据集里抽的、还保留了原文件名，那么公开数据集里**含有测试集的原图**——
+     把它当训练数据就等于把测试集混进了训练集，LB 会虚高。**用之前必须先确认测试集是怎么切出来的。**
+     （此条**尚未核实**，是风险提示不是结论。）
+3. ~~继续提高分辨率~~**已试过，放弃**：288px 对 224px 做过单折受控 A/B，best val_f1 是 0.8958 vs 0.8990
+   （差 0.3 张图，噪声范围内 = 没测出收益），却贵 1.65 倍。真正的瓶颈不是像素不够，
+   是"400 张训练图 + 细粒度禾本科二分类"这个数据量缺口。
+4. **裁剪到绿色区域再缩放**：ExG 掩码已经有了，把图裁到绿色包围盒能让幼苗填满画面，
+   等价于在植物本身上提高有效分辨率。对小图没帮助，对那 40% 的大图可能有。**尚未实现，需先做 A/B。**
+5. **扩大集成**：在 `BACKBONES` 里再加 `resnet50` / `densenet121` / `convnext_base` 等不同权重版本。
+6. **伪标签**：用当前提交给 378 张测试图打软标签，置信度 > 0.95 的并入训练集再训一轮。
+
+### 需要重点盯的指标
+OOF 混淆矩阵里 **Black-grass / Common wheat / Loose Silky-bent** 三者之间的误判数。
+原版基线的 OOF 口径 F1 是 0.8898，本版所有改动都是为了把这三个格子的数字压下去。

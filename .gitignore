@@ -1,0 +1,45 @@
+# 训练产物与权重（体积大，GitHub 单文件上限 100 MB）
+*.pt
+*.pth
+*.onnx
+*.safetensors
+*.npy
+*.npz
+*.pkl
+
+# 训练输出目录
+t3_out/
+t4_out*/
+t3_run_*/
+*_foldcache/
+*_foldckpt/
+probe_*/
+smoke_*/
+
+# 数据集（体积大；且按比赛规则不应再分发）
+data/
+datasets/
+fer_data/
+detection/
+segmentation/
+*.zip
+
+# Python
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 日志与临时文件
+*.log
+*.tmp
+~$*
